@@ -41,6 +41,14 @@ ENT.StuckJump = true
 ENT.SearchRadius = 1500
 ENT.LoseTargetDistance = 2500
 
+-- PERCEPTION
+-- Bryce only acquires players inside its forward view and with a clear line
+-- of sight. A short memory window lets it investigate the last seen position.
+ENT.TargetFOV = 150
+ENT.TargetScanInterval = 0.35
+ENT.VisibilityCheckInterval = 0.12
+ENT.TargetMemoryTime = 2.5
+
 -- PATHFINDING
 ENT.PathLookAhead = 300
 ENT.PathTolerance = 20
@@ -124,6 +132,13 @@ function ENT:Initialize()
     self.Enemy = nil
     self.NextAttack = 0
 
+    self.NextTargetScan = 0
+    self.NextVisibilityCheck = 0
+    self.CachedVisibilityTarget = nil
+    self.CachedTargetVisible = false
+    self.LastKnownTargetPos = nil
+    self.LastSeenTime = 0
+
     self.ForceGrowth = false
     self.IsGrowing = false
     self.HasTransformed = false
@@ -149,6 +164,31 @@ function ENT:Initialize()
     self:StartActivity(self.IdleActivity)
 
     print("[Bryce NPC] Initialized successfully.")
+
+end
+
+
+----------------------------------------------------------------
+-- MOVEMENT ANIMATION
+----------------------------------------------------------------
+
+-- BodyMoveXY drives the move_x/move_y pose parameters on models that
+-- support them. Keep it limited to locomotion activities because some
+-- models do not support BodyMoveXY during every animation.
+function ENT:BodyUpdate()
+
+    local activity = self:GetActivity()
+
+    if activity == self.WalkActivity
+    or activity == self.RunActivity then
+
+        self:BodyMoveXY()
+
+    else
+
+        self:FrameAdvance()
+
+    end
 
 end
 
@@ -204,13 +244,125 @@ end
 -- TARGET MANAGEMENT
 ----------------------------------------------------------------
 
+function ENT:IsValidTarget(target)
+
+    if not IsValid(target) then
+        return false
+    end
+
+    if not target:IsPlayer() or not target:Alive() then
+        return false
+    end
+
+    if target:IsFlagSet(FL_NOTARGET) then
+        return false
+    end
+
+    return true
+
+end
+
+
+function ENT:IsWithinVisionCone(target)
+
+    if not IsValid(target) then
+        return false
+    end
+
+    local direction = target:WorldSpaceCenter() - self:WorldSpaceCenter()
+
+    if direction:LengthSqr() <= 1 then
+        return true
+    end
+
+    local forward = self:GetForward()
+    local dot = forward:Dot(direction:GetNormalized())
+    local minimumDot = math.cos(math.rad(self.TargetFOV * 0.5))
+
+    return dot >= minimumDot
+
+end
+
+
+function ENT:HasLineOfSightTo(target)
+
+    if not IsValid(target) then
+        return false
+    end
+
+    local trace = util.TraceLine({
+        start = self:WorldSpaceCenter(),
+        endpos = target:WorldSpaceCenter(),
+        filter = { self },
+        mask = MASK_VISIBLE
+    })
+
+    return not trace.Hit or trace.Entity == target
+
+end
+
+
+function ENT:CanSeeTarget(target)
+
+    if not self:IsValidTarget(target) then
+        return false
+    end
+
+    local now = CurTime()
+
+    -- Avoid tracing every coroutine tick. A small cache keeps perception
+    -- responsive without repeatedly tracing the same player every frame.
+    if self.CachedVisibilityTarget ~= target
+    or now >= self.NextVisibilityCheck then
+
+        self.CachedVisibilityTarget = target
+        self.NextVisibilityCheck = now + self.VisibilityCheckInterval
+
+        self.CachedTargetVisible =
+            self:IsWithinVisionCone(target)
+            and self:HasLineOfSightTo(target)
+
+        if self.CachedTargetVisible then
+            self.LastKnownTargetPos = target:GetPos()
+            self.LastSeenTime = now
+        end
+
+    end
+
+    return self.CachedTargetVisible
+
+end
+
+
 function ENT:SetEnemy(enemy)
 
-    if IsValid(enemy) then
-        self.Enemy = enemy
-    else
+    if not self:IsValidTarget(enemy) then
+
         self.Enemy = nil
+        self.LastKnownTargetPos = nil
+        self.LastSeenTime = 0
+
+        self.CachedVisibilityTarget = nil
+        self.CachedTargetVisible = false
+
+        return
+
     end
+
+    if self.Enemy ~= enemy then
+
+        self.LastKnownTargetPos = nil
+        self.LastSeenTime = 0
+
+        self.CachedVisibilityTarget = nil
+        self.CachedTargetVisible = false
+
+    end
+
+    self.Enemy = enemy
+
+    -- Seed the memory immediately when acquiring a visible target.
+    self:CanSeeTarget(enemy)
 
 end
 
@@ -219,20 +371,30 @@ function ENT:GetEnemy()
 
     local enemy = self.Enemy
 
-    -- Keep the current target if possible.
-    if IsValid(enemy)
-    and enemy:IsPlayer()
-    and enemy:Alive() then
+    if self:IsValidTarget(enemy) then
 
-        local distance = self:GetRangeSquaredTo(
-            enemy:GetPos()
-        )
+        local distance = self:GetRangeSquaredTo(enemy:GetPos())
 
         if distance <= self.LoseTargetDistance ^ 2 then
-            return enemy
+
+            if self:CanSeeTarget(enemy) then
+                return enemy
+            end
+
+            -- Briefly remember where the player was last seen, rather than
+            -- following their live position through walls.
+            if self.LastKnownTargetPos
+            and CurTime() - self.LastSeenTime <= self.TargetMemoryTime then
+
+                return enemy
+
+            end
+
         end
 
     end
+
+    self:SetEnemy(nil)
 
     return self:FindEnemy()
 
@@ -241,18 +403,25 @@ end
 
 function ENT:FindEnemy()
 
+    local now = CurTime()
+
+    if now < self.NextTargetScan then
+        return nil
+    end
+
+    self.NextTargetScan = now + self.TargetScanInterval
+
     local nearestEnemy = nil
     local shortestDistance = self.SearchRadius ^ 2
 
     for _, ply in ipairs(player.GetAll()) do
 
-        if IsValid(ply) and ply:Alive() then
+        if self:IsValidTarget(ply) then
 
-            local distance = self:GetRangeSquaredTo(
-                ply:GetPos()
-            )
+            local distance = self:GetRangeSquaredTo(ply:GetPos())
 
-            if distance < shortestDistance then
+            if distance < shortestDistance
+            and self:CanSeeTarget(ply) then
 
                 shortestDistance = distance
                 nearestEnemy = ply
@@ -270,17 +439,9 @@ function ENT:FindEnemy()
 end
 
 
-----------------------------------------------------------------
--- TARGET VALIDATION
-----------------------------------------------------------------
-
 function ENT:CanAttack(target)
 
-    if not IsValid(target) then
-        return false
-    end
-
-    if not target:IsPlayer() or not target:Alive() then
+    if not self:IsValidTarget(target) then
         return false
     end
 
@@ -302,12 +463,22 @@ function ENT:ChaseEnemy()
         return "lost"
     end
 
+    local function getGoal()
+
+        if self:CanSeeTarget(enemy) then
+            return enemy:GetPos()
+        end
+
+        return self.LastKnownTargetPos or enemy:GetPos()
+
+    end
+
     local path = Path("Follow")
 
     path:SetMinLookAheadDistance(self.PathLookAhead)
     path:SetGoalTolerance(self.PathTolerance)
 
-    path:Compute(self, enemy:GetPos())
+    path:Compute(self, getGoal())
 
     if not path:IsValid() then
         return "failed"
@@ -315,23 +486,11 @@ function ENT:ChaseEnemy()
 
     while IsValid(self) and path:IsValid() do
 
-        --------------------------------------------------------
-        -- TRANSFORMATION INTERRUPT
-        --------------------------------------------------------
-
         if self:ShouldTransform() then
             return "transform"
         end
 
-        --------------------------------------------------------
-        -- UPDATE TRANSFORMATION
-        --------------------------------------------------------
-
         self:UpdateGrowth()
-
-        --------------------------------------------------------
-        -- MOVEMENT
-        --------------------------------------------------------
 
         self.loco:SetDesiredSpeed(
             self:GetMovementSpeed(self.RunSpeed)
@@ -339,31 +498,21 @@ function ENT:ChaseEnemy()
 
         self.loco:SetAcceleration(self.RunAcceleration)
 
-        --------------------------------------------------------
-        -- TARGET
-        --------------------------------------------------------
-
         enemy = self:GetEnemy()
 
         if not IsValid(enemy) then
             return "lost"
         end
 
-        --------------------------------------------------------
-        -- ATTACK RANGE
-        --------------------------------------------------------
-
         if self:CanAttack(enemy) then
             return "ok"
         end
 
-        --------------------------------------------------------
-        -- RECOMPUTE PATH
-        --------------------------------------------------------
-
+        -- Rebuild the path periodically. If Bryce has lost sight, getGoal()
+        -- returns the last seen position instead of the player's live position.
         if path:GetAge() >= self.RepathInterval then
 
-            path:Compute(self, enemy:GetPos())
+            path:Compute(self, getGoal())
 
             if not path:IsValid() then
                 return "failed"
@@ -371,21 +520,26 @@ function ENT:ChaseEnemy()
 
         end
 
-        --------------------------------------------------------
-        -- FOLLOW PATH
-        --------------------------------------------------------
-
         path:Update(self)
-
-        --------------------------------------------------------
-        -- STUCK DETECTION
-        --------------------------------------------------------
 
         if self.loco:IsStuck() then
 
             self:HandleStuck()
 
             return "stuck"
+
+        end
+
+        -- Stop at the last known position instead of repeatedly walking
+        -- into a wall after the short search-memory window expires.
+        if not self:CanSeeTarget(enemy)
+        and self.LastKnownTargetPos
+        and self:GetRangeSquaredTo(self.LastKnownTargetPos)
+            <= (self.PathTolerance * 1.5) ^ 2 then
+
+            self:SetEnemy(nil)
+
+            return "lost"
 
         end
 
@@ -1049,3 +1203,18 @@ end
 ----------------------------------------------------------------
 -- END OF BRYCE NPC
 ----------------------------------------------------------------
+
+
+----------------------------------------------------------------
+-- SPAWN MENU
+----------------------------------------------------------------
+
+if CLIENT then
+
+    list.Set("NPC", "npc_bryce", {
+        Name = "Bryce NPC",
+        Class = "npc_bryce",
+        Category = "Custom NPCs"
+    })
+
+end
